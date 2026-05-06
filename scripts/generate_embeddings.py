@@ -8,6 +8,7 @@ from typing import Callable, Dict
 
 import faiss
 import requests
+from tqdm import tqdm
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.llms.utils import resolve_llm
 
@@ -192,7 +193,9 @@ if __name__ == "__main__":
     # documents = md_parser.get_nodes_from_documents(documents)
 
     # Create chunks/nodes
+    print(f"\nLoaded {len(documents)} documents. Chunking (size={args.chunk}, overlap={args.overlap})...")
     nodes = Settings.text_splitter.get_nodes_from_documents(documents)
+    print(f"Created {len(nodes)} chunks")
 
     # Filter out invalid nodes
     good_nodes = []
@@ -216,11 +219,24 @@ if __name__ == "__main__":
 
     good_nodes.extend(runbook_nodes)
 
-    # Create & save Index
-    index = VectorStoreIndex(
-        good_nodes,
-        storage_context=storage_context,
-    )
+    batch_size = 2048
+    total_batches = (len(good_nodes) + batch_size - 1) // batch_size
+    print(f"\nEmbedding {len(good_nodes)} chunks in {total_batches} batches of {batch_size}...")
+
+    # Embed in batches with outer progress tracking
+    index = None
+    for batch_num in range(0, len(good_nodes), batch_size):
+        batch = good_nodes[batch_num:batch_num + batch_size]
+        batch_idx = batch_num // batch_size + 1
+        print(f"\n[Batch {batch_idx}/{total_batches}]")
+        if index is None:
+            index = VectorStoreIndex(
+                batch,
+                storage_context=storage_context,
+                show_progress=True,
+            )
+        else:
+            index.insert_nodes(batch, show_progress=True)
     index.set_index_id(args.index)
     index.storage_context.persist(persist_dir=PERSIST_FOLDER)
 

@@ -6,14 +6,16 @@ import os
 import time
 from typing import Callable, Dict
 
+import re
+
 import faiss
 import requests
 from tqdm import tqdm
 from llama_index.core import Settings, SimpleDirectoryReader, VectorStoreIndex
 from llama_index.core.llms.utils import resolve_llm
 
-# from llama_index.core.node_parser import MarkdownNodeParser
 from llama_index.core.schema import TextNode
+from section_chunker import chunk_document, chunks_to_text_nodes
 from llama_index.core.storage.storage_context import StorageContext
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.readers.file.flat.base import FlatReader
@@ -188,25 +190,17 @@ if __name__ == "__main__":
         args.folder, recursive=True, file_metadata=ocp_file_metadata_func
     ).load_data()
 
-    # Split based on header/section
-    # md_parser = MarkdownNodeParser()
-    # documents = md_parser.get_nodes_from_documents(documents)
-
-    # Create chunks/nodes
-    print(f"\nLoaded {len(documents)} documents. Chunking (size={args.chunk}, overlap={args.overlap})...")
-    nodes = Settings.text_splitter.get_nodes_from_documents(documents)
-    print(f"Created {len(nodes)} chunks")
-
-    # Filter out invalid nodes
+    # Section-aware chunking with hierarchy preservation
+    print(f"\nLoaded {len(documents)} documents. Chunking with section awareness...")
     good_nodes = []
-    for node in nodes:
-        if isinstance(node, TextNode) and got_whitespace(node.text):
-            # Exclude given metadata during embedding
-            # if args.exclude_metadata is not None:
-            #     node.excluded_embed_metadata_keys.extend(args.exclude_metadata)
-            good_nodes.append(node)
-        else:
-            print("skipping node without whitespace: " + node.__repr__())
+    for doc in documents:
+        text = doc.get_content()
+        metadata = doc.metadata or {}
+        chunks = chunk_document(text, max_tokens=args.chunk, min_words=50)
+        nodes = chunks_to_text_nodes(chunks, metadata)
+        good_nodes.extend(nodes)
+
+    print(f"Created {len(good_nodes)} chunks from {len(documents)} documents")
 
     runbook_documents = SimpleDirectoryReader(
         args.runbooks,
@@ -218,6 +212,56 @@ if __name__ == "__main__":
     runbook_nodes = Settings.text_splitter.get_nodes_from_documents(runbook_documents)
 
     good_nodes.extend(runbook_nodes)
+
+    # Chunk statistics
+    word_counts = sorted(len(n.text.split()) for n in good_nodes)
+    total = len(word_counts)
+    buckets = {"<20": 0, "20-49": 0, "50-99": 0, "100-199": 0, "200-299": 0, "300+": 0}
+    for wc in word_counts:
+        if wc < 20: buckets["<20"] += 1
+        elif wc < 50: buckets["20-49"] += 1
+        elif wc < 100: buckets["50-99"] += 1
+        elif wc < 200: buckets["100-199"] += 1
+        elif wc < 300: buckets["200-299"] += 1
+        else: buckets["300+"] += 1
+
+    print(f"\nChunk statistics ({total} chunks):")
+    print(f"  Min: {word_counts[0]} words, Max: {word_counts[-1]} words, "
+          f"Avg: {sum(word_counts)//total} words, Median: {word_counts[total//2]} words")
+    print(f"  Size distribution:")
+    for label, count in buckets.items():
+        pct = count * 100 // total
+        bar = "#" * (pct // 2)
+        print(f"    {label:>10}: {count:5d} ({pct:2d}%) {bar}")
+
+    # Heading level vs chunk size analysis
+    level_stats = {}  # level -> list of word counts
+    no_header = []
+    for n in good_nodes:
+        text = n.text.strip()
+        wc = len(text.split())
+        # Check first line for heading level
+        first_line = text.split("\n")[0]
+        header_match = re.match(r'^(#+)\s', first_line)
+        if header_match:
+            level = len(header_match.group(1))
+            level_stats.setdefault(level, []).append(wc)
+        else:
+            no_header.append(wc)
+
+    print(f"\n  Heading level vs size (chunks starting with # heading):")
+    for level in sorted(level_stats.keys()):
+        wcs = sorted(level_stats[level])
+        total_l = len(wcs)
+        small = sum(1 for w in wcs if w < 50)
+        print(f"    H{level} ({total_l:4d} chunks): "
+              f"avg={sum(wcs)//total_l:3d}w, median={wcs[total_l//2]:3d}w, "
+              f"<50w={small} ({small*100//total_l}%)")
+    if no_header:
+        small = sum(1 for w in no_header if w < 50)
+        print(f"    No heading ({len(no_header):4d} chunks): "
+              f"avg={sum(no_header)//len(no_header):3d}w, median={sorted(no_header)[len(no_header)//2]:3d}w, "
+              f"<50w={small} ({small*100//len(no_header)}%)")
 
     batch_size = 2048
     total_batches = (len(good_nodes) + batch_size - 1) // batch_size
